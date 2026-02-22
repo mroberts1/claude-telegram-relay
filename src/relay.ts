@@ -36,6 +36,12 @@ const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
 const TRUSTED_BOT_IDS = (process.env.TRUSTED_BOT_IDS || "").split(",").filter(Boolean);
 let consecutiveBotMessages = 0;
 const MAX_BOT_CHAIN = 3;
+
+// Internal HTTP bridge for bot-to-bot communication
+// (Telegram doesn't deliver bot messages to other bots — this works around that)
+const RELAY_PORT = parseInt(process.env.RELAY_PORT || "0"); // 0 = disabled
+const SIBLING_BOT_URLS = (process.env.SIBLING_BOT_URLS || "").split(",").filter(Boolean);
+
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const PROJECT_DIR = process.env.PROJECT_DIR || "";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
@@ -170,6 +176,53 @@ if (!(await acquireLock())) {
 }
 
 const bot = new Bot(BOT_TOKEN);
+
+// ============================================================
+// INTERNAL HTTP BRIDGE (bot-to-bot communication)
+// ============================================================
+// Telegram does not deliver bot messages to other bots. This bridge
+// lets each bot POST its replies to sibling bots' HTTP endpoints,
+// which process them as if they arrived via Telegram.
+
+async function notifySiblings(senderName: string, text: string, chatId: number): Promise<void> {
+  if (SIBLING_BOT_URLS.length === 0) return;
+  for (const url of SIBLING_BOT_URLS) {
+    fetch(`${url}/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ senderName, text, chatId }),
+    }).catch((err) => console.error(`Bridge notify error (${url}):`, err));
+  }
+}
+
+async function processSiblingMessage(
+  senderName: string,
+  text: string,
+  chatId: number
+): Promise<void> {
+  const myName = (process.env.BOT_NAME || "").toLowerCase();
+  if (!myName || !text.toLowerCase().includes(myName)) return;
+  if (consecutiveBotMessages >= MAX_BOT_CHAIN) {
+    console.log(`Bot chain limit (${MAX_BOT_CHAIN}) reached — dropping message from ${senderName}`);
+    return;
+  }
+  consecutiveBotMessages++;
+
+  console.log(`Bridge: ${senderName} → ${process.env.BOT_NAME}: "${text.substring(0, 60)}"`);
+
+  const enrichedPrompt = buildPrompt(text, undefined, undefined, senderName);
+  const rawResponse = await callClaude(enrichedPrompt, { resume: true });
+  const response = await processMemoryIntents(supabase, rawResponse);
+
+  await saveMessage("assistant", response);
+
+  try {
+    await bot.api.sendMessage(chatId, response);
+    await notifySiblings(process.env.BOT_NAME || "Bot", response, chatId);
+  } catch (error) {
+    console.error("Bridge send error:", error);
+  }
+}
 
 // ============================================================
 // SECURITY: Only respond to authorized user
@@ -373,6 +426,11 @@ bot.on("message:text", async (ctx) => {
 
   await saveMessage("assistant", response);
   await sendResponse(ctx, response);
+
+  // Notify sibling bots if this is a group chat — they can't see our Telegram messages
+  if ((ctx.chat.type === "group" || ctx.chat.type === "supergroup") && SIBLING_BOT_URLS.length > 0) {
+    notifySiblings(process.env.BOT_NAME || "Bot", response, ctx.chat.id).catch(console.error);
+  }
 });
 
 // Voice messages
@@ -525,7 +583,8 @@ const USER_TIMEZONE = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolve
 function buildPrompt(
   userMessage: string,
   relevantContext?: string,
-  memoryContext?: string
+  memoryContext?: string,
+  fromName?: string  // set when message comes from a sibling bot via the HTTP bridge
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -542,7 +601,11 @@ function buildPrompt(
     "You are a personal AI assistant responding via Telegram. Keep responses concise and conversational.",
   ];
 
-  if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);
+  if (fromName) {
+    parts.push(`You are in a group conversation. ${fromName} is speaking to you.`);
+  } else if (USER_NAME) {
+    parts.push(`You are speaking with ${USER_NAME}.`);
+  }
   parts.push(`Current time: ${timeStr}`);
   if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
   if (memoryContext) parts.push(`\n${memoryContext}`);
@@ -598,6 +661,40 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
 
 // ============================================================
 // START
+// ============================================================
+
+// ============================================================
+// START BRIDGE SERVER (if port configured)
+// ============================================================
+
+if (RELAY_PORT > 0) {
+  Bun.serve({
+    port: RELAY_PORT,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (req.method === "POST" && url.pathname === "/message") {
+        try {
+          const body = (await req.json()) as {
+            senderName: string;
+            text: string;
+            chatId: number;
+          };
+          // Process async — respond immediately so the sender doesn't block
+          processSiblingMessage(body.senderName, body.text, body.chatId).catch(console.error);
+          return new Response("ok", { status: 200 });
+        } catch {
+          return new Response("bad request", { status: 400 });
+        }
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  console.log(`Bridge server listening on port ${RELAY_PORT}`);
+  console.log(`Sibling bots: ${SIBLING_BOT_URLS.join(", ") || "none"}`);
+}
+
+// ============================================================
+// START BOT
 // ============================================================
 
 console.log("Starting Claude Telegram Relay...");
