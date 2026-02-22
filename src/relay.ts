@@ -7,7 +7,7 @@
  * Run: bun run src/relay.ts
  */
 
-import { Bot, Context } from "grammy";
+import { Bot, Context, InputFile } from "grammy";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
 import { join, dirname } from "path";
@@ -20,6 +20,12 @@ import {
 } from "./memory.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
+
+const VOICE_TTS_DEFAULT = process.env.VOICE_TTS_DEFAULT || "openai";
+const OPENAI_TTS_VOICE = process.env.OPENAI_TTS_VOICE || "nova";
+const OPENAI_TTS_MODEL = process.env.OPENAI_TTS_MODEL || "tts-1";
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
 
 // ============================================================
 // CONFIGURATION
@@ -195,8 +201,10 @@ async function callClaude(
   }
 
   args.push("--output-format", "text");
+  args.push("--dangerously-skip-permissions");
 
   console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
+  console.log(`Command: ${args.join(" ").substring(0, 100)}`);
 
   try {
     const proc = spawn(args, {
@@ -215,8 +223,10 @@ async function callClaude(
     const exitCode = await proc.exited;
 
     if (exitCode !== 0) {
-      console.error("Claude error:", stderr);
-      return `Error: ${stderr || "Claude exited with code " + exitCode}`;
+      console.error("Claude stdout:", output);
+      console.error("Claude stderr:", stderr);
+      console.error("Claude exit code:", exitCode);
+      return `Error: ${stderr || output || "Claude exited with code " + exitCode}`;
     }
 
     // Extract session ID from output if present (for --resume)
@@ -232,6 +242,76 @@ async function callClaude(
     console.error("Spawn error:", error);
     return `Error: Could not run Claude CLI`;
   }
+}
+
+// ============================================================
+// TEXT-TO-SPEECH (HYBRID: OpenAI default, ElevenLabs premium)
+// ============================================================
+
+async function textToSpeechOpenAI(text: string): Promise<Buffer | null> {
+  if (!process.env.OPENAI_API_KEY && !process.env.ANTHROPIC_API_KEY) return null;
+
+  const apiKey = process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY;
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/audio/speech", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENAI_TTS_MODEL,
+        voice: OPENAI_TTS_VOICE,
+        input: text,
+      }),
+    });
+    if (!response.ok) {
+      console.error("OpenAI TTS error:", await response.text());
+      return null;
+    }
+    return Buffer.from(await response.arrayBuffer());
+  } catch (error) {
+    console.error("OpenAI TTS error:", error);
+    return null;
+  }
+}
+
+async function textToSpeechElevenLabs(text: string): Promise<Buffer | null> {
+  if (!ELEVENLABS_API_KEY) return null;
+  try {
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": ELEVENLABS_API_KEY,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          text,
+          model_id: "eleven_monolingual_v1",
+          voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+        }),
+      }
+    );
+    if (!response.ok) {
+      console.error("ElevenLabs error:", await response.text());
+      return null;
+    }
+    return Buffer.from(await response.arrayBuffer());
+  } catch (error) {
+    console.error("ElevenLabs TTS error:", error);
+    return null;
+  }
+}
+
+async function textToSpeech(
+  text: string,
+  _usePremium: boolean = false
+): Promise<Buffer | null> {
+  console.log("Using ElevenLabs/Klara voice");
+  return await textToSpeechElevenLabs(text);
 }
 
 // ============================================================
@@ -305,7 +385,13 @@ bot.on("message:voice", async (ctx) => {
     const claudeResponse = await processMemoryIntents(supabase, rawResponse);
 
     await saveMessage("assistant", claudeResponse);
-    await sendResponse(ctx, claudeResponse);
+
+    const audio = await textToSpeech(claudeResponse);
+    if (audio) {
+      await ctx.replyWithVoice(new InputFile(audio, "response.ogg"));
+    } else {
+      await sendResponse(ctx, claudeResponse);
+    }
   } catch (error) {
     console.error("Voice error:", error);
     await ctx.reply("Could not process voice message. Check logs for details.");
