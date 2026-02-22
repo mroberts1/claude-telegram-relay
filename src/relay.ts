@@ -33,6 +33,9 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8i
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
+const TRUSTED_BOT_IDS = (process.env.TRUSTED_BOT_IDS || "").split(",").filter(Boolean);
+let consecutiveBotMessages = 0;
+const MAX_BOT_CHAIN = 3;
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const PROJECT_DIR = process.env.PROJECT_DIR || "";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
@@ -174,12 +177,41 @@ const bot = new Bot(BOT_TOKEN);
 
 bot.use(async (ctx, next) => {
   const userId = ctx.from?.id.toString();
+  const isFromBot = ctx.from?.is_bot === true;
+  const isFromTrustedBot = isFromBot && TRUSTED_BOT_IDS.includes(userId || "");
 
-  // If ALLOWED_USER_ID is set, enforce it
-  if (ALLOWED_USER_ID && userId !== ALLOWED_USER_ID) {
-    console.log(`Unauthorized: ${userId}`);
-    await ctx.reply("This bot is private.");
+  // Reset bot chain counter on any human message
+  if (!isFromBot) consecutiveBotMessages = 0;
+
+  // Only allow authorized user or trusted sibling bots
+  if (ALLOWED_USER_ID && userId !== ALLOWED_USER_ID && !isFromTrustedBot) {
     return;
+  }
+
+  // In group chats, apply mention/name filtering
+  const chatType = ctx.chat?.type;
+  if (chatType === "group" || chatType === "supergroup") {
+    const text = ctx.message && "text" in ctx.message ? ctx.message.text : "";
+    const entities = ctx.message && "entities" in ctx.message ? ctx.message.entities ?? [] : [];
+    const botUsername = ctx.me.username;
+    const botName = (process.env.BOT_NAME || "").toLowerCase();
+
+    const mentioned = entities.some(
+      (e) =>
+        e.type === "mention" &&
+        text.substring(e.offset, e.offset + e.length) === `@${botUsername}`
+    );
+
+    if (isFromTrustedBot) {
+      // Bot-to-bot: respond if named anywhere in message, subject to depth limit
+      const namedByBot = botName && text.toLowerCase().includes(botName);
+      if (!namedByBot || consecutiveBotMessages >= MAX_BOT_CHAIN) return;
+      consecutiveBotMessages++;
+    } else {
+      // Human: respond if named at start or @mentioned
+      const namedDirectly = botName && text.toLowerCase().startsWith(botName);
+      if (!mentioned && !namedDirectly) return;
+    }
   }
 
   await next();
