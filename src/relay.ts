@@ -201,7 +201,8 @@ async function processSiblingMessage(
   chatId: number
 ): Promise<void> {
   const myName = (process.env.BOT_NAME || "").toLowerCase();
-  if (!myName || !text.toLowerCase().includes(myName)) return;
+  const myNameCore = myName.startsWith("@") ? myName.slice(1) : myName;
+  if (!myNameCore || !text.toLowerCase().includes(myNameCore)) return;
   if (consecutiveBotMessages >= MAX_BOT_CHAIN) {
     console.log(`Bot chain limit (${MAX_BOT_CHAIN}) reached — dropping message from ${senderName}`);
     return;
