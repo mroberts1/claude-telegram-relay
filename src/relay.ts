@@ -598,7 +598,7 @@ function buildPrompt(
   });
 
   const parts = [
-    "You are a personal AI assistant responding via Telegram. Keep responses concise and conversational.",
+    "You are a personal AI assistant responding via Telegram. Keep responses concise and conversational. Never use stage directions or asterisk actions (like *pauses* or *tilts head*). Respond only in plain prose.",
   ];
 
   if (fromName) {
