@@ -286,6 +286,7 @@ async function callClaude(
     args.push("--resume", session.sessionId);
   }
 
+  args.push("--model", "claude-haiku-4-5-20251001");
   args.push("--output-format", "text");
   args.push("--dangerously-skip-permissions");
 
